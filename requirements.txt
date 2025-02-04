@@ -1,0 +1,7 @@
+requests
+pillow
+pytesseract
+sentence-transformers
+numpy
+torch
+fastapi
