@@ -7,9 +7,11 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 from dotenv import load_dotenv
-from subprocess import run
+from subprocess import run, CalledProcessError
+import uuid  # For generating unique filenames
 
-load_dotenv()  # Load environment variables from .env
+# Load environment variables from .env
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -58,7 +60,10 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-AIPROXY_TOKEN = os.environ["AIPROXY_TOKEN"]
+AIPROXY_TOKEN = os.getenv("AIPROXY_TOKEN")
+if not AIPROXY_TOKEN:
+    raise ValueError("AIPROXY_TOKEN environment variable is not set")
+
 headers = {
     "Content-Type": "application/json",
     "Authorization": f"Bearer {AIPROXY_TOKEN}"
@@ -72,7 +77,7 @@ def home():
 def task_runner(task: str = Query(..., description="Plain-English task description")):
     url = "http://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
     
-    # Prompt for the LLM (updated to include uv script usage instruction)
+    # Prompt for the LLM
     prompt = """
     You are an advanced Automation Agent that dynamically generates code to execute multi‑step tasks described in plain English. Your output must produce processing artifacts that exactly match pre‑computed expected results. Follow these instructions rigorously:
 
@@ -137,7 +142,11 @@ def task_runner(task: str = Query(..., description="Plain-English task descripti
     If the task format a file using prettier the shell should not True   
     
     Understand the task carefully what it want then do as it
-    Note: if the task ask for sender-email from a input file then the output file should only contain the sender email no perfix sentence and the pormpt for that should to extract the sender email only
+    Note: if the task ask for sender-email Here’s a clean and effective prompt that ensures only the sender’s email is extracted without including unnecessary instructions in the output:
+
+"Find and return only the sender's email address from the following text:"
+
+This keeps the prompt clear while ensuring the output is just the extracted sender's email. If you're using this in a script or automation, make sure the extraction logic correctly isolates the sender's email without adding extra text.
     Note: if the task ask for extract the credit card number by Passing the image to an LLM, have it extract the card number, and write it without spaces to than it should extract the numbers only(eg.prompt: Extract all the text correctly from the image, focusing on the longest continuous string of numbers.
     and payload(in sample format) : {
   "model": "gpt-4o-mini",
@@ -145,7 +154,7 @@ def task_runner(task: str = Query(..., description="Plain-English task descripti
     {
       "role": "user",
       "content": [
-        {"type": "text", "text": "Extract all the text correctly from the image, focusing on the longest continuous string of numbers."},
+        {"type": "text", "text": "Extract the 16 digit numeric string from the image, focusing on the longest continuous string of characters."},
         {
           "type": "image_url",
           "image_url": { "url": "data:image/png;base64,$IMAGE_BASE64" }
@@ -154,14 +163,25 @@ def task_runner(task: str = Query(..., description="Plain-English task descripti
     }
   ]
 })
+
+    Note: Compute Similarity:
+    Convert the list of embeddings into a NumPy array.
+    Use a cosine similarity function (e.g., cosine_similarity from scikit-learn or a custom implementation) to compute a similarity matrix for all pairs of comment embeddings.
+    Exclude self-similarity by setting the diagonal of the similarity matrix to -1.
+    Find the pair of comments with the highest cosine similarity (i.e., the most similar pair).
+    
+    be careful it is compulsory to execute each task within 15 second timer and 
     """
 
-    
     max_retries = 4
     attempts = 0
     success = False
     last_error = None
     previous_code = None
+
+    # Generate a unique filename for this task
+    task_id = str(uuid.uuid4())  # Generate a unique ID for the task
+    script_filename = f"llm_{task_id}.py"  # Unique filename for each task
 
     while attempts < max_retries and not success:
         try:
@@ -204,15 +224,14 @@ def task_runner(task: str = Query(..., description="Plain-English task descripti
             # ///
             # """
 
-            with open('llm.py', 'w') as f:
+            # Write the generated code to a unique file
+            with open(script_filename, 'w') as f:
                 f.write(Inline_metadata_script)
-                f.write("\n")
-                f.write("\n")
-                f.write("\n")
+                f.write("\n\n\n")
                 f.write(python_code)
 
             # Execute code
-            output = run(["uv", "run", "llm.py"], capture_output=True, text=True, cwd=os.getcwd())
+            output = run(["uv", "run", script_filename], capture_output=True, text=True, cwd=os.getcwd())
 
             if output.returncode == 0:
                 success = True
@@ -233,6 +252,10 @@ def task_runner(task: str = Query(..., description="Plain-English task descripti
         except requests.RequestException as e:
             logger.error(f"API request failed: {str(e)}")
             raise HTTPException(status_code=500, detail="AI Proxy communication error")
+        except CalledProcessError as e:
+            logger.error(f"Subprocess execution failed: {str(e)}")
+            last_error = e.stderr
+            attempts += 1
         except Exception as e:
             logger.error(f"Unexpected error: {str(e)}")
             last_error = str(e)
@@ -243,12 +266,8 @@ def task_runner(task: str = Query(..., description="Plain-English task descripti
             status_code=500,
             detail=f"Task failed after {max_retries} attempts. Last error: {last_error}"
         )
-    # Execute code
-    output = run(["uv", "run", "llm.py"], capture_output=True, text=True, cwd=os.getcwd())
-    
-    print(output)
 
-    return result
+    return {"status": "success", "output": output.stdout, "script_filename": script_filename}
 
 @app.get("/read", response_class=PlainTextResponse)
 def task_reader(path: str = Query(..., description="Path to the file to read")):
@@ -260,12 +279,9 @@ def task_reader(path: str = Query(..., description="Path to the file to read")):
     try:
         with open(path, 'r') as file:
             content = file.read().strip()
-            print(content)
-            
-        return content
-
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid path format.")
+            return content
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
 
